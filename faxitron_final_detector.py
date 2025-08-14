@@ -14,6 +14,7 @@ import matplotlib.patches as patches
 from matplotlib.patches import Rectangle
 import re
 import easyocr
+import time
 
 class FaxitronFinalDetector:
     """Final working version that detects all annotations including text."""
@@ -992,81 +993,183 @@ def process_single_image(detector: FaxitronFinalDetector, image_path: str, outpu
         print(f"Processing: {Path(image_path).name}")
         print(f"{'='*60}")
         
+        print(f"📁 Input image: {image_path}")
+        print(f"📁 Output directory: {output_dir}")
+        
+        # Check if image exists
+        if not Path(image_path).exists():
+            print(f"❌ Error: Image file {image_path} does not exist")
+            return False
+        
+        # Get image size
+        image_size = Path(image_path).stat().st_size
+        print(f"📏 Image size: {image_size:,} bytes ({image_size/1024/1024:.1f} MB)")
+        
+        print(f"\n🔍 Starting analysis...")
+        start_time = time.time()
+        
         # Analyze annotations
         results = detector.analyze_annotations(image_path)
+        
+        analysis_time = time.time() - start_time
+        print(f"✅ Analysis completed in {analysis_time:.1f}s")
+        print(f"📊 Found {results['basic_rectangles_count']} basic rectangles")
         
         # Create image-specific output directory
         image_name = Path(image_path).stem
         image_output_dir = output_dir / image_name
+        print(f"📂 Creating output directory: {image_output_dir}")
         image_output_dir.mkdir(exist_ok=True)
+        
+        print(f"\n💾 Saving results...")
+        save_start = time.time()
         
         # Save results
         json_path = image_output_dir / "detection_results.json"
         detector.save_results(results, str(json_path))
+        print(f"  ✅ Full results: {json_path}")
         
         # Save simplified results
         simplified_json_path = image_output_dir / "simplified_basic_rectangles.json"
         detector.save_simplified_results(results, str(simplified_json_path))
+        print(f"  ✅ Simplified results: {simplified_json_path}")
+        
+        save_time = time.time() - save_start
+        print(f"💾 Files saved in {save_time:.1f}s")
+        
+        print(f"\n🎨 Creating visualizations...")
+        vis_start = time.time()
         
         # Create visualizations
         vis_path = image_output_dir / "qc_visualization.png"
         detector.create_qc_visualization(image_path, results, str(vis_path))
+        print(f"  ✅ QC visualization: {vis_path}")
         
         simplified_vis_path = image_output_dir / "simplified_qc_visualization.png"
         detector.create_simplified_qc_visualization(image_path, results, str(simplified_vis_path))
+        print(f"  ✅ Simplified QC: {simplified_vis_path}")
+        
+        vis_time = time.time() - vis_start
+        print(f"🎨 Visualizations created in {vis_time:.1f}s")
         
         # Print summary
-        print(f"✓ Successfully processed {Path(image_path).name}")
-        print(f"  Basic rectangles found: {results['basic_rectangles_count']}")
-        print(f"  Results saved to: {image_output_dir}")
+        total_time = time.time() - start_time
+        print(f"\n📊 Processing Summary:")
+        print(f"  ✅ Successfully processed {Path(image_path).name}")
+        print(f"  📊 Basic rectangles found: {results['basic_rectangles_count']}")
+        print(f"  📁 Results saved to: {image_output_dir}")
+        print(f"  ⏱️  Total processing time: {total_time:.1f}s")
+        print(f"  🚀 Processing speed: {1/total_time:.2f} images/second")
         
         return True
         
     except Exception as e:
-        print(f"✗ Error processing {Path(image_path).name}: {str(e)}")
+        print(f"❌ Error processing {Path(image_path).name}: {str(e)}")
+        import traceback
+        traceback.print_exc()
         return False
 
-def process_folder(detector: FaxitronFinalDetector, folder_path: str, output_dir: Path) -> None:
+def process_folder(detector: FaxitronFinalDetector, folder_path: str, output_dir: Path, verbose: bool = False) -> None:
     """Process all images in a folder sequentially."""
+    print(f"\n{'='*80}")
+    print(f"STARTING FOLDER PROCESSING")
+    print(f"{'='*80}")
+    
     folder_path = Path(folder_path)
     
     if not folder_path.exists():
-        print(f"Error: Folder {folder_path} does not exist")
+        print(f"❌ Error: Folder {folder_path} does not exist")
         return
     
+    print(f"📁 Processing folder: {folder_path}")
+    print(f"📁 Output directory: {output_dir}")
+    
     # Find all image files
+    print(f"\n🔍 Scanning for image files...")
     image_extensions = {'.jpg', '.jpeg', '.png', '.tiff', '.tif', '.bmp'}
     image_files = []
     
     for ext in image_extensions:
-        image_files.extend(folder_path.glob(f"*{ext}"))
-        image_files.extend(folder_path.glob(f"*{ext.upper()}"))
+        jpeg_files = list(folder_path.glob(f"*{ext}"))
+        jpeg_upper_files = list(folder_path.glob(f"*{ext.upper()}"))
+        image_files.extend(jpeg_files)
+        image_files.extend(jpeg_upper_files)
+        if verbose:
+            print(f"  Found {len(jpeg_files)} {ext} files")
+            print(f"  Found {len(jpeg_upper_files)} {ext.upper()} files")
+    
+    # Remove duplicates and sort
+    image_files = list(set(image_files))
+    image_files.sort()
     
     if not image_files:
-        print(f"No image files found in {folder_path}")
+        print(f"❌ No image files found in {folder_path}")
         return
     
-    print(f"Found {len(image_files)} images to process")
-    print(f"Output directory: {output_dir}")
+    print(f"\n✅ Found {len(image_files)} total images to process")
+    if verbose:
+        print(f"📋 Image list:")
+        for i, img in enumerate(image_files[:10]):  # Show first 10
+            print(f"  {i+1:3d}. {img.name}")
+        if len(image_files) > 10:
+            print(f"  ... and {len(image_files) - 10} more images")
+    
+    # Create output directory
+    print(f"\n📂 Creating output directory: {output_dir}")
+    output_dir.mkdir(exist_ok=True)
     
     # Process each image
     successful = 0
     failed = 0
+    start_time = time.time()
     
-    for image_file in sorted(image_files):
-        if process_single_image(detector, str(image_file), output_dir):
-            successful += 1
-        else:
+    print(f"\n🚀 Starting image processing...")
+    print(f"{'='*80}")
+    
+    for i, image_file in enumerate(image_files, 1):
+        print(f"\n📸 Processing image {i}/{len(image_files)}: {image_file.name}")
+        print(f"⏱️  Progress: {i}/{len(image_files)} ({i/len(image_files)*100:.1f}%)")
+        
+        try:
+            if process_single_image(detector, str(image_file), output_dir):
+                successful += 1
+                print(f"✅ Successfully processed {image_file.name}")
+            else:
+                failed += 1
+                print(f"❌ Failed to process {image_file.name}")
+        except Exception as e:
             failed += 1
+            print(f"💥 Exception while processing {image_file.name}: {str(e)}")
+            if verbose:
+                import traceback
+                traceback.print_exc()
+        
+        # Show time estimates
+        elapsed_time = time.time() - start_time
+        avg_time_per_image = elapsed_time / i
+        remaining_images = len(image_files) - i
+        estimated_remaining = remaining_images * avg_time_per_image
+        
+        print(f"⏱️  Elapsed: {elapsed_time:.1f}s, Avg per image: {avg_time_per_image:.1f}s")
+        print(f"⏱️  Estimated remaining time: {estimated_remaining:.1f}s ({estimated_remaining/60:.1f} minutes)")
     
     # Print final summary
-    print(f"\n{'='*60}")
-    print(f"PROCESSING COMPLETE")
-    print(f"{'='*60}")
-    print(f"Successfully processed: {successful}")
-    print(f"Failed: {failed}")
-    print(f"Total: {len(image_files)}")
-    print(f"Results saved to: {output_dir}")
+    total_time = time.time() - start_time
+    print(f"\n{'='*80}")
+    print(f"🎉 PROCESSING COMPLETE")
+    print(f"{'='*80}")
+    print(f"📊 Results Summary:")
+    print(f"  ✅ Successfully processed: {successful}")
+    print(f"  ❌ Failed: {failed}")
+    print(f"  📁 Total images: {len(image_files)}")
+    print(f"  ⏱️  Total processing time: {total_time:.1f}s ({total_time/60:.1f} minutes)")
+    print(f"  📂 Results saved to: {output_dir}")
+    print(f"  🚀 Average speed: {len(image_files)/total_time:.2f} images/minute")
+    
+    if failed > 0:
+        print(f"\n⚠️  {failed} images failed to process. Check the output above for details.")
+    
+    print(f"{'='*80}")
 
 def cli_main():
     """CLI entry point for the Faxitron Final Detector."""
@@ -1126,26 +1229,37 @@ Examples:
     args = parser.parse_args()
     
     # Initialize detector
-    print("Initializing Faxitron Final Detector...")
+    print("🚀 Initializing Faxitron Final Detector...")
+    if args.verbose:
+        print(f"📋 Arguments:")
+        print(f"  Input: {'Image: ' + args.image if args.image else 'Folder: ' + args.folder}")
+        print(f"  Output: {args.output}")
+        print(f"  Verbose: {args.verbose}")
+        print(f"  No visualization: {args.no_visualization}")
+    
     detector = FaxitronFinalDetector()
     
     # Create output directory
     output_dir = Path(args.output)
+    print(f"📂 Setting up output directory: {output_dir}")
     output_dir.mkdir(exist_ok=True)
     
     # Process based on input type
     if args.image:
         # Single image processing
+        print(f"📸 Processing single image: {args.image}")
         if not Path(args.image).exists():
-            print(f"Error: Image file {args.image} does not exist")
+            print(f"❌ Error: Image file {args.image} does not exist")
             return 1
         
         process_single_image(detector, args.image, output_dir)
         
     elif args.folder:
         # Folder processing
-        process_folder(detector, args.folder, output_dir)
+        print(f"📁 Processing folder: {args.folder}")
+        process_folder(detector, args.folder, output_dir, args.verbose)
     
+    print(f"\n🎉 Processing complete!")
     return 0
 
 if __name__ == "__main__":
