@@ -1,0 +1,13 @@
+name: faxitron
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.9
+  - pip
+  - pip:
+    - opencv-python-headless>=4.8.0
+    - Pillow>=9.0.0
+    - numpy>=1.21.0
+    - easyocr>=1.7.0
+    - matplotlib>=3.5.0

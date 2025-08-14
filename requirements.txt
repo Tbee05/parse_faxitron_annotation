@@ -1,0 +1,15 @@
+# Faxitron Final Detector Dependencies
+# Core image processing
+opencv-python-headless>=4.8.0
+Pillow>=9.0.0
+numpy>=1.21.0
+
+# OCR and text extraction
+easyocr>=1.7.0
+
+# Visualization and plotting
+matplotlib>=3.5.0
+
+# Optional: For GPU acceleration (uncomment if you have CUDA)
+# torch>=1.13.0
+# torchvision>=0.14.0
