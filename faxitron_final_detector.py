@@ -15,19 +15,14 @@ from matplotlib.patches import Rectangle
 import re
 import easyocr
 import time
+import multiprocessing as mp
+from functools import partial
+import logging
 
 class FaxitronFinalDetector:
     """Final working version that detects all annotations including text."""
     
     def __init__(self):
-        # Multiple HSV color ranges for yellow detection
-        self.yellow_ranges = [
-            (np.array([15, 100, 100]), np.array([35, 255, 255])),  # Standard yellow
-            (np.array([20, 80, 80]), np.array([40, 255, 255])),    # Lighter yellow
-            (np.array([10, 120, 120]), np.array([30, 255, 255])),  # Darker yellow
-            (np.array([25, 70, 70]), np.array([45, 255, 255]))     # Very light yellow
-        ]
-        
         # Initialize EasyOCR reader for text extraction
         try:
             self.reader = easyocr.Reader(['en'], gpu=False)  # Use CPU mode
@@ -47,22 +42,179 @@ class FaxitronFinalDetector:
         
         return image
     
-    def detect_yellow_regions(self, image: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-        """Detect yellow regions using multiple HSV ranges."""
+    def detect_non_greyscale_colors(self, image: np.ndarray) -> Tuple[np.ndarray, Dict[str, Any]]:
+        """Dynamically detect non-greyscale colored regions instead of hardcoding yellow."""
+        # Convert BGR to HSV for better color analysis
         hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
         
-        # Combine multiple yellow masks
-        combined_mask = np.zeros(hsv.shape[:2], dtype=np.uint8)
+        # Convert to RGB for easier color analysis
+        rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
         
-        for lower, upper in self.yellow_ranges:
-            mask = cv2.inRange(hsv, lower, upper)
-            combined_mask = cv2.bitwise_or(combined_mask, mask)
+        # Create mask for non-greyscale colors
+        # A pixel is considered non-greyscale if any of R, G, B channels differ significantly
+        r, g, b = rgb[:, :, 0], rgb[:, :, 1], rgb[:, :, 2]
         
-        # Minimal cleaning to preserve small details
+        # Calculate color differences
+        rg_diff = np.abs(r.astype(np.int16) - g.astype(np.int16))
+        rb_diff = np.abs(r.astype(np.int16) - b.astype(np.int16))
+        gb_diff = np.abs(g.astype(np.int16) - b.astype(np.int16))
+        
+        # A pixel is non-greyscale if any channel difference is above threshold
+        threshold = 30  # Adjustable threshold for color sensitivity
+        non_greyscale_mask = (rg_diff > threshold) | (rb_diff > threshold) | (gb_diff > threshold)
+        
+        # Convert to uint8 for morphological operations
+        non_greyscale_mask = non_greyscale_mask.astype(np.uint8) * 255
+        
+        # Clean up the mask
         kernel = np.ones((2, 2), np.uint8)
-        combined_mask = cv2.morphologyEx(combined_mask, cv2.MORPH_CLOSE, kernel)
+        non_greyscale_mask = cv2.morphologyEx(non_greyscale_mask, cv2.MORPH_CLOSE, kernel)
         
-        return combined_mask, hsv
+        # Analyze the colors found
+        colored_pixels = rgb[non_greyscale_mask > 0]
+        if len(colored_pixels) > 0:
+            # Calculate dominant colors
+            dominant_colors = self.analyze_dominant_colors(colored_pixels)
+        else:
+            dominant_colors = {}
+        
+        color_stats = {
+            'total_colored_pixels': int(np.sum(non_greyscale_mask > 0)),
+            'colored_percentage': float(np.sum(non_greyscale_mask > 0) / (image.shape[0] * image.shape[1]) * 100),
+            'dominant_colors': dominant_colors,
+            'threshold_used': threshold
+        }
+        
+        return non_greyscale_mask, color_stats
+    
+    def analyze_dominant_colors(self, colored_pixels: np.ndarray) -> Dict[str, Any]:
+        """Analyze the dominant colors in the colored regions."""
+        if len(colored_pixels) == 0:
+            return {}
+        
+        # Convert to HSV for better color classification
+        colored_pixels_hsv = cv2.cvtColor(colored_pixels.reshape(-1, 1, 3), cv2.COLOR_RGB2HSV)
+        colored_pixels_hsv = colored_pixels_hsv.reshape(-1, 3)
+        
+        # Define color ranges for classification
+        color_ranges = {
+            'yellow': {'hue': (20, 30), 'saturation': (100, 255), 'value': (100, 255)},
+            'orange': {'hue': (10, 20), 'saturation': (100, 255), 'value': (100, 255)},
+            'green': {'hue': (35, 85), 'saturation': (100, 255), 'value': (100, 255)},
+            'red': {'hue': (0, 10), 'saturation': (100, 255), 'value': (100, 255)},
+            'blue': {'hue': (100, 130), 'saturation': (100, 255), 'value': (100, 255)},
+            'purple': {'hue': (130, 160), 'saturation': (100, 255), 'value': (100, 255)}
+        }
+        
+        color_counts = {}
+        total_pixels = len(colored_pixels_hsv)
+        
+        for color_name, ranges in color_ranges.items():
+            # Handle red color wrap-around in HSV
+            if color_name == 'red':
+                mask1 = (colored_pixels_hsv[:, 0] >= ranges['hue'][0]) & (colored_pixels_hsv[:, 0] <= ranges['hue'][1])
+                mask2 = (colored_pixels_hsv[:, 0] >= 170) & (colored_pixels_hsv[:, 0] <= 180)
+                mask = mask1 | mask2
+            else:
+                mask = (colored_pixels_hsv[:, 0] >= ranges['hue'][0]) & (colored_pixels_hsv[:, 0] <= ranges['hue'][1])
+            
+            mask &= (colored_pixels_hsv[:, 1] >= ranges['saturation'][0]) & (colored_pixels_hsv[:, 1] <= ranges['saturation'][1])
+            mask &= (colored_pixels_hsv[:, 2] >= ranges['value'][0]) & (colored_pixels_hsv[:, 2] <= ranges['value'][1])
+            
+            count = np.sum(mask)
+            if count > 0:
+                color_counts[color_name] = {
+                    'count': int(count),
+                    'percentage': float(count / total_pixels * 100),
+                    'hue_range': ranges['hue'],
+                    'saturation_range': ranges['saturation'],
+                    'value_range': ranges['value']
+                }
+        
+        # Sort by count
+        sorted_colors = sorted(color_counts.items(), key=lambda x: x[1]['count'], reverse=True)
+        
+        return {
+            'detected_colors': dict(sorted_colors),
+            'total_analyzed_pixels': total_pixels
+        }
+    
+    def get_annotation_color(self, image: np.ndarray, annotation: Dict[str, Any]) -> Dict[str, Any]:
+        """Extract the dominant color of a specific annotation region."""
+        try:
+            # Extract the region from the image
+            x, y, w, h = annotation['x'], annotation['y'], annotation['width'], annotation['height']
+            
+            # Ensure coordinates are within image bounds
+            x = max(0, x)
+            y = max(0, y)
+            w = min(w, image.shape[1] - x)
+            h = min(h, image.shape[0] - y)
+            
+            if w <= 0 or h <= 0:
+                return {'error': 'invalid_region'}
+            
+            # Extract the region
+            region = image[y:y+h, x:x+w]
+            
+            if region.size == 0:
+                return {'error': 'empty_region'}
+            
+            # Ensure region is in uint8 format for OpenCV operations
+            if region.dtype != np.uint8:
+                if region.dtype == np.int32 or region.dtype == np.int64:
+                    # Handle integer types by clipping to valid range
+                    region = np.clip(region, 0, 255).astype(np.uint8)
+                else:
+                    # For other types, try to convert safely
+                    region = region.astype(np.uint8)
+            
+            # Convert BGR to RGB for color analysis
+            region_rgb = cv2.cvtColor(region, cv2.COLOR_BGR2RGB)
+            
+            # Analyze colors in this specific region
+            colored_pixels = region_rgb.reshape(-1, 3)
+            
+            # Calculate average color
+            avg_color = np.mean(colored_pixels, axis=0).astype(int)
+            
+            # Convert to HSV for classification
+            avg_color_hsv = cv2.cvtColor(avg_color.reshape(1, 1, 3), cv2.COLOR_RGB2HSV).reshape(3)
+            
+            # Classify the color
+            color_name = self.classify_color(avg_color_hsv)
+            
+            return {
+                'rgb': avg_color.tolist(),
+                'hsv': avg_color_hsv.tolist(),
+                'color_name': color_name,
+                'region_size': (w, h)
+            }
+            
+        except Exception as e:
+            return {'error': str(e)}
+    
+    def classify_color(self, hsv_values: np.ndarray) -> str:
+        """Classify a color based on HSV values."""
+        h, s, v = hsv_values
+        
+        # Define color ranges
+        if s < 50 or v < 50:  # Low saturation or value = greyscale
+            return 'greyscale'
+        elif h < 10 or h > 170:  # Red (wraps around)
+            return 'red'
+        elif 10 <= h < 25:
+            return 'orange'
+        elif 25 <= h < 35:
+            return 'yellow'
+        elif 35 <= h < 85:
+            return 'green'
+        elif 85 <= h < 130:
+            return 'blue'
+        elif 130 <= h < 160:
+            return 'purple'
+        else:
+            return 'unknown'
     
     def calculate_overlap(self, rect1: Dict[str, Any], rect2: Dict[str, Any]) -> float:
         """Calculate overlap ratio between two rectangles."""
@@ -294,10 +446,10 @@ class FaxitronFinalDetector:
             print(f"Error: {e}")
             return f"error_{str(e)[:20]}"
     
-    def detect_all_annotations(self, yellow_mask: np.ndarray) -> List[Dict[str, Any]]:
+    def detect_all_annotations(self, color_mask: np.ndarray) -> List[Dict[str, Any]]:
         """Detect all annotations using all contour detection methods."""
         # Use RETR_LIST to get all contours (including nested ones)
-        contours, hierarchy = cv2.findContours(yellow_mask, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
+        contours, hierarchy = cv2.findContours(color_mask, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
         
         annotations = []
         for i, contour in enumerate(contours):
@@ -352,11 +504,11 @@ class FaxitronFinalDetector:
         # Load image
         image = self.load_image(image_path)
         
-        # Detect yellow regions
-        yellow_mask, hsv = self.detect_yellow_regions(image)
+        # Detect non-greyscale colored regions (instead of hardcoded yellow)
+        color_mask, color_stats = self.detect_non_greyscale_colors(image)
         
         # Detect all annotations
-        all_annotations = self.detect_all_annotations(yellow_mask)
+        all_annotations = self.detect_all_annotations(color_mask)
         
         # Filter out redundant main regions
         filtered_annotations = self.filter_redundant_regions(all_annotations)
@@ -377,6 +529,10 @@ class FaxitronFinalDetector:
             print(f"Extracting text from {ann['type']} {ann['id']}:")
             extracted_text = self.extract_text_from_basic_rectangle(image, ann)
             ann['extracted_text'] = extracted_text
+            
+            # Extract color information for this annotation
+            color_info = self.get_annotation_color(image, ann)
+            ann['color_info'] = color_info
         
         # Find text annotations and extract text content (keeping existing functionality)
         text_annotations = []
@@ -385,17 +541,29 @@ class FaxitronFinalDetector:
                 # Extract actual text content using OCR
                 extracted_text = self.extract_text_from_region(image, ann)
                 ann['extracted_text'] = extracted_text
+                
+                # Extract color information for text annotations too
+                color_info = self.get_annotation_color(image, ann)
+                ann['color_info'] = color_info
+                
                 text_annotations.append(ann)
         
-        # Create simplified output for basic rectangles
+        # Create simplified output for basic rectangles - NOW USING CENTER COORDINATES
         simplified_basic_rectangles = []
         for rect in unique_basic_rectangles:
             simplified_rect = {
                 'id': rect['id'],
                 'type': rect['type'],
-                'x': rect['x'],
-                'y': rect['y'],
-                'extracted_text': rect.get('extracted_text', 'unknown')
+                'x': rect['center'][0],  # Use center X instead of top-left X
+                'y': rect['center'][1],  # Use center Y instead of top-left Y
+                'extracted_text': rect.get('extracted_text', 'unknown'),
+                'color_info': rect.get('color_info', {}),
+                'rectangle_bounds': {
+                    'top_left_x': rect['x'],
+                    'top_left_y': rect['y'],
+                    'width': rect['width'],
+                    'height': rect['height']
+                }
             }
             simplified_basic_rectangles.append(simplified_rect)
         
@@ -416,9 +584,11 @@ class FaxitronFinalDetector:
             'text_annotations_count': len(text_annotations),
             'basic_rectangles_count': len(unique_basic_rectangles),
             'filtered_out': len(all_annotations) - len(filtered_annotations),
-            'yellow_mask_stats': {
-                'total_yellow_pixels': int(np.sum(yellow_mask > 0)),
-                'yellow_percentage': float(np.sum(yellow_mask > 0) / (image.shape[0] * image.shape[1]) * 100)
+            'color_detection_stats': color_stats,  # Updated from yellow_mask_stats
+            'processing_notes': {
+                'coordinate_system': 'center_based',
+                'color_detection': 'dynamic_non_greyscale',
+                'duplicate_removal': 'overlap_based'
             }
         }
         
@@ -442,11 +612,11 @@ class FaxitronFinalDetector:
         ax1.imshow(image_array)
         ax1.set_title("Original Image", fontsize=14, weight='bold')
         
-        # 2. Yellow mask (top center left)
+        # 2. Color mask (top center left)
         ax2 = fig.add_subplot(gs[0, 1])
-        yellow_mask, _ = self.detect_yellow_regions(self.load_image(image_path))
-        ax2.imshow(yellow_mask, cmap='gray')
-        ax2.set_title(f"Yellow Mask\n{results['yellow_mask_stats']['total_yellow_pixels']} yellow pixels", 
+        color_mask, _ = self.detect_non_greyscale_colors(self.load_image(image_path))
+        ax2.imshow(color_mask, cmap='gray')
+        ax2.set_title(f"Color Mask\n{results['color_detection_stats']['total_colored_pixels']} colored pixels", 
                      fontsize=12, weight='bold')
         
         # 3. All annotations color-coded by type (top center right)
@@ -499,13 +669,14 @@ class FaxitronFinalDetector:
                 alpha=0.8
             )
             ax4.add_patch(rect_patch)
-                    # Add text label with extracted text content
-        text_content = ann.get('extracted_text', 'unknown')
-        # Truncate long text for display
-        display_text = text_content[:15] + "..." if len(text_content) > 15 else text_content
-        ax4.text(ann['center'][0], ann['center'][1] - 5, 
-                f"{display_text}", 
-                color='blue', fontsize=6, ha='center', weight='bold')
+            
+            # Add text label with extracted text content
+            text_content = ann.get('extracted_text', 'unknown')
+            # Truncate long text for display
+            display_text = text_content[:15] + "..." if len(text_content) > 15 else text_content
+            ax4.text(ann['center'][0], ann['center'][1] - 5, 
+                    f"{display_text}", 
+                    color='blue', fontsize=6, ha='center', weight='bold')
         
         # 5. Main regions and large rectangles (middle left)
         ax5 = fig.add_subplot(gs[1, 0])
@@ -672,9 +843,23 @@ DETECTION RESULTS:
 • Total Annotations: {results['total_annotations']}
 • Text Annotations: {results['text_annotations_count']}
 • Filtered Out: {results['filtered_out']}
-• Yellow Pixels: {results['yellow_mask_stats']['total_yellow_pixels']:,}
-• Yellow Percentage: {results['yellow_mask_stats']['yellow_percentage']:.2f}%
+• Colored Pixels: {results['color_detection_stats']['total_colored_pixels']:,}
+• Colored Percentage: {results['color_detection_stats']['colored_percentage']:.2f}%
 
+COLOR DETECTION:
+• Dynamic non-greyscale detection
+• Threshold: {results['color_detection_stats']['threshold_used']}
+"""
+        
+        # Add color information if available
+        if 'dominant_colors' in results['color_detection_stats'] and 'detected_colors' in results['color_detection_stats']['dominant_colors']:
+            detected_colors = results['color_detection_stats']['dominant_colors']['detected_colors']
+            if detected_colors:
+                summary_text += "• Detected Colors:\n"
+                for color_name, color_info in list(detected_colors.items())[:5]:  # Show top 5
+                    summary_text += f"  - {color_name}: {color_info['percentage']:.1f}%\n"
+        
+        summary_text += f"""
 ANNOTATION TYPES:
 """
         
@@ -691,6 +876,8 @@ QC NOTES:
 • Irregular shapes are highlighted in PURPLE
 • Redundant main regions have been filtered out
 • OCR confidence threshold: 0.3
+• Coordinate system: Center-based (x,y = rectangle center)
+• Color detection: Dynamic non-greyscale
 """
         
         ax12.text(0.05, 0.95, summary_text, transform=ax12.transAxes, 
@@ -768,8 +955,16 @@ QC NOTES:
             text_content = rect.get('extracted_text', 'unknown')
             # Truncate long text for display
             display_text = text_content[:15] + "..." if len(text_content) > 15 else text_content
+            
+            # Add color information if available
+            color_info = rect.get('color_info', {})
+            if 'color_name' in color_info and color_info['color_name'] != 'greyscale':
+                color_label = f"{display_text}\n({color_info['color_name']})"
+            else:
+                color_label = display_text
+            
             ax2.text(rect['center'][0], rect['center'][1], 
-                    f"{display_text}", 
+                    color_label, 
                     color=color, fontsize=8, ha='center', weight='bold',
                     bbox=dict(boxstyle="round,pad=0.3", facecolor="white", alpha=0.8))
         
@@ -782,13 +977,25 @@ Dimensions: {results['image_dimensions']['width']} × {results['image_dimensions
 
 DETECTION RESULTS:
 • Total Basic Rectangles: {results['basic_rectangles_count']}
-• Yellow Pixels: {results['yellow_mask_stats']['total_yellow_pixels']:,}
-• Yellow Percentage: {results['yellow_mask_stats']['yellow_percentage']:.2f}%
+• Colored Pixels: {results['color_detection_stats']['total_colored_pixels']:,}
+• Colored Percentage: {results['color_detection_stats']['colored_percentage']:.2f}%
 
 TEXT EXTRACTION:
 • Main Regions (M): {len([r for r in results['annotations']['basic_rectangles'] if r['type'] == 'main_region'])}
 • Large Rectangles (L): {len([r for r in results['annotations']['basic_rectangles'] if r['type'] == 'large_rectangle'])}
+
+COORDINATE SYSTEM:
+• x,y coordinates = Rectangle center (not top-left corner)
+• Rectangle bounds stored separately for reference
 """
+        
+        # Add color detection summary
+        if 'dominant_colors' in results['color_detection_stats'] and 'detected_colors' in results['color_detection_stats']['dominant_colors']:
+            detected_colors = results['color_detection_stats']['dominant_colors']['detected_colors']
+            if detected_colors:
+                summary_text += "\nCOLOR DETECTION:\n"
+                for color_name, color_info in list(detected_colors.items())[:3]:  # Show top 3
+                    summary_text += f"• {color_name}: {color_info['percentage']:.1f}%\n"
         
         # Add summary as text box
         ax2.text(0.02, 0.98, summary_text, transform=ax2.transAxes, 
@@ -818,7 +1025,7 @@ TEXT EXTRACTION:
             'image_dimensions': results['image_dimensions'],
             'basic_rectangles': results['simplified_basic_rectangles'],
             'total_basic_rectangles': results['basic_rectangles_count'],
-            'yellow_mask_stats': results['yellow_mask_stats']
+            'color_detection_stats': results['color_detection_stats']
         }
         
         with open(output_path, 'w') as f:
@@ -830,6 +1037,11 @@ TEXT EXTRACTION:
         text_summary = []
         
         for ann in results['annotations']['text']:
+            # Get color information
+            color_info = ann.get('color_info', {})
+            color_name = color_info.get('color_name', 'unknown') if 'error' not in color_info else 'error'
+            rgb_values = color_info.get('rgb', [0, 0, 0]) if 'error' not in color_info else [0, 0, 0]
+            
             text_summary.append({
                 'id': ann['id'],
                 'x': ann['x'],
@@ -838,7 +1050,11 @@ TEXT EXTRACTION:
                 'center_y': ann['center'][1],
                 'extracted_text': ann.get('extracted_text', 'unknown'),
                 'area': ann['area'],
-                'confidence': 'high' if ann.get('extracted_text') not in ['no_text_detected', 'low_confidence', 'error'] else 'low'
+                'confidence': 'high' if ann.get('extracted_text') not in ['no_text_detected', 'low_confidence', 'error'] else 'low',
+                'color_info': {
+                    'color_name': color_name,
+                    'rgb': rgb_values
+                }
             })
         
         return text_summary
@@ -848,16 +1064,31 @@ TEXT EXTRACTION:
         basic_rectangles_summary = []
         
         for ann in results['annotations']['basic_rectangles']:
+            # Get color information
+            color_info = ann.get('color_info', {})
+            color_name = color_info.get('color_name', 'unknown') if 'error' not in color_info else 'error'
+            rgb_values = color_info.get('rgb', [0, 0, 0]) if 'error' not in color_info else [0, 0, 0]
+            
             basic_rectangles_summary.append({
                 'id': ann['id'],
                 'type': ann['type'],
-                'x': ann['x'],
-                'y': ann['y'],
+                'x': ann['center'][0],  # Center X coordinate
+                'y': ann['center'][1],  # Center Y coordinate
                 'center_x': ann['center'][0],
                 'center_y': ann['center'][1],
                 'extracted_text': ann.get('extracted_text', 'unknown'),
                 'area': ann['area'],
-                'confidence': 'high' if ann.get('extracted_text') not in ['no_text_detected', 'low_confidence', 'error', 'ocr_not_available'] else 'low'
+                'confidence': 'high' if ann.get('extracted_text') not in ['no_text_detected', 'low_confidence', 'error', 'ocr_not_available'] else 'low',
+                'color_info': {
+                    'color_name': color_name,
+                    'rgb': rgb_values,
+                    'rectangle_bounds': {
+                        'top_left_x': ann['x'],
+                        'top_left_y': ann['y'],
+                        'width': ann['width'],
+                        'height': ann['height']
+                    }
+                }
             })
         
         return basic_rectangles_summary
@@ -918,20 +1149,36 @@ def main():
         print(f"Text annotations: {results['text_annotations_count']}")
         print(f"Basic rectangles: {results['basic_rectangles_count']}")
         print(f"Filtered out: {results['filtered_out']}")
-        print(f"Yellow pixels: {results['yellow_mask_stats']['total_yellow_pixels']} ({results['yellow_mask_stats']['yellow_percentage']:.2f}%)")
+        print(f"Colored pixels: {results['color_detection_stats']['total_colored_pixels']} ({results['color_detection_stats']['colored_percentage']:.2f}%)")
         
-        # Print basic rectangles with extracted content
+        # Print color detection information
+        print(f"\nColor Detection Results:")
+        print(f"Detection threshold: {results['color_detection_stats']['threshold_used']}")
+        if 'dominant_colors' in results['color_detection_stats'] and 'detected_colors' in results['color_detection_stats']['dominant_colors']:
+            detected_colors = results['color_detection_stats']['dominant_colors']['detected_colors']
+            if detected_colors:
+                print(f"Detected colors:")
+                for color_name, color_info in detected_colors.items():
+                    print(f"  {color_name}: {color_info['count']} pixels ({color_info['percentage']:.1f}%)")
+            else:
+                print("  No specific colors detected")
+        else:
+            print("  Color analysis not available")
+        
+        # Print basic rectangles with extracted content and color info
         if results['basic_rectangles_count'] > 0:
             print(f"\nBasic Rectangles Found:")
             for ann in results['annotations']['basic_rectangles']:
                 text_content = ann.get('extracted_text', 'unknown')
-                print(f"  {ann['type']} {ann['id']}: '{text_content}' at ({ann['center'][0]}, {ann['center'][1]})")
+                color_info = ann.get('color_info', {})
+                color_name = color_info.get('color_name', 'unknown') if 'error' not in color_info else 'error'
+                print(f"  {ann['type']} {ann['id']}: '{text_content}' at center ({ann['center'][0]}, {ann['center'][1]}) - Color: {color_name}")
             
             # Get and display basic rectangles summary
             basic_rectangles_summary = detector.get_basic_rectangles_summary(results)
-            print(f"\nBasic Rectangles Summary (Coordinates and Extracted Text):")
+            print(f"\nBasic Rectangles Summary (Center Coordinates and Extracted Text):")
             for rect_summary in basic_rectangles_summary:
-                print(f"  {rect_summary['type']} {rect_summary['id']}: '{rect_summary['extracted_text']}' at ({rect_summary['x']}, {rect_summary['y']}) - Center: ({rect_summary['center_x']}, {rect_summary['center_y']}) - Confidence: {rect_summary['confidence']}")
+                print(f"  {rect_summary['type']} {rect_summary['id']}: '{rect_summary['extracted_text']}' at center ({rect_summary['center_x']}, {rect_summary['center_y']}) - Confidence: {rect_summary['confidence']}")
         
         # Print annotation types
         type_counts = {}
@@ -943,18 +1190,25 @@ def main():
         for ann_type, count in type_counts.items():
             print(f"  {ann_type}: {count}")
         
-        # Print text annotations with extracted content
+        # Print text annotations with extracted content and color info
         if results['text_annotations_count'] > 0:
             print(f"\nText Annotations Found:")
             for ann in results['annotations']['text'][:10]:  # Show first 10
                 text_content = ann.get('extracted_text', 'unknown')
-                print(f"  Text {ann['id']}: '{text_content}' at ({ann['center'][0]}, {ann['center'][1]})")
+                color_info = ann.get('color_info', {})
+                color_name = color_info.get('color_name', 'unknown') if 'error' not in color_info else 'error'
+                print(f"  Text {ann['id']}: '{text_content}' at ({ann['center'][0]}, {ann['center'][1]}) - Color: {color_name}")
             
             # Get and display text summary
             text_summary = detector.get_text_annotations_summary(results)
             print(f"\nText Summary (Coordinates and Extracted Text):")
             for text_ann in text_summary:
                 print(f"  ID {text_ann['id']}: '{text_ann['extracted_text']}' at ({text_ann['x']}, {text_ann['y']}) - Center: ({text_ann['center_x']}, {text_ann['center_y']}) - Confidence: {text_ann['confidence']}")
+        
+        # Print processing notes
+        print(f"\nProcessing Notes:")
+        for key, value in results['processing_notes'].items():
+            print(f"  {key}: {value}")
         
         # Save results
         output_dir = Path("faxitron_final_output")
@@ -1171,6 +1425,212 @@ def process_folder(detector: FaxitronFinalDetector, folder_path: str, output_dir
     
     print(f"{'='*80}")
 
+def process_single_image_parallel(args_tuple):
+    """Process a single image for parallel processing (worker function)."""
+    detector, image_path, output_dir, image_index, total_images = args_tuple
+    
+    try:
+        # Create a unique detector instance for this process to avoid conflicts
+        local_detector = FaxitronFinalDetector()
+        
+        print(f"\n{'='*60}")
+        print(f"Processing: {Path(image_path).name} (Worker {mp.current_process().name})")
+        print(f"{'='*60}")
+        
+        print(f"📁 Input image: {image_path}")
+        print(f"📁 Output directory: {output_dir}")
+        print(f"📊 Progress: {image_index}/{total_images} ({image_index/total_images*100:.1f}%)")
+        
+        # Check if image exists
+        if not Path(image_path).exists():
+            print(f"❌ Error: Image file {image_path} does not exist")
+            return False, image_path, "File not found"
+        
+        # Get image size
+        image_size = Path(image_path).stat().st_size
+        print(f"📏 Image size: {image_size:,} bytes ({image_size/1024/1024:.1f} MB)")
+        
+        print(f"\n🔍 Starting analysis...")
+        start_time = time.time()
+        
+        # Analyze annotations
+        results = local_detector.analyze_annotations(image_path)
+        
+        analysis_time = time.time() - start_time
+        print(f"✅ Analysis completed in {analysis_time:.1f}s")
+        print(f"📊 Found {results['basic_rectangles_count']} basic rectangles")
+        
+        # Create image-specific output directory
+        image_name = Path(image_path).stem
+        image_output_dir = output_dir / image_name
+        print(f"📂 Creating output directory: {image_output_dir}")
+        image_output_dir.mkdir(exist_ok=True)
+        
+        print(f"\n💾 Saving results...")
+        save_start = time.time()
+        
+        # Save results
+        json_path = image_output_dir / "detection_results.json"
+        local_detector.save_results(results, str(json_path))
+        print(f"  ✅ Full results: {json_path}")
+        
+        # Save simplified results
+        simplified_json_path = image_output_dir / "simplified_basic_rectangles.json"
+        local_detector.save_simplified_results(results, str(simplified_json_path))
+        print(f"  ✅ Simplified results: {simplified_json_path}")
+        
+        save_time = time.time() - save_start
+        print(f"💾 Files saved in {save_time:.1f}s")
+        
+        print(f"\n🎨 Creating visualizations...")
+        vis_start = time.time()
+        
+        # Create visualizations
+        vis_path = image_output_dir / "qc_visualization.png"
+        local_detector.create_qc_visualization(image_path, results, str(vis_path))
+        print(f"  ✅ QC visualization: {vis_path}")
+        
+        simplified_vis_path = image_output_dir / "simplified_qc_visualization.png"
+        local_detector.create_simplified_qc_visualization(image_path, results, str(simplified_vis_path))
+        print(f"  ✅ Simplified QC: {simplified_vis_path}")
+        
+        vis_time = time.time() - vis_start
+        print(f"🎨 Visualizations created in {vis_time:.1f}s")
+        
+        # Print summary
+        total_time = time.time() - start_time
+        print(f"\n📊 Processing Summary:")
+        print(f"  ✅ Successfully processed {Path(image_path).name}")
+        print(f"  📊 Basic rectangles found: {results['basic_rectangles_count']}")
+        print(f"  📁 Results saved to: {image_output_dir}")
+        print(f"  ⏱️  Total processing time: {total_time:.1f}s")
+        print(f"  🚀 Processing speed: {1/total_time:.2f} images/second")
+        
+        return True, image_path, f"Success: {results['basic_rectangles_count']} rectangles"
+        
+    except Exception as e:
+        error_msg = f"Error processing {Path(image_path).name}: {str(e)}"
+        print(f"❌ {error_msg}")
+        import traceback
+        traceback.print_exc()
+        return False, image_path, str(e)
+
+def process_folder_parallel(detector: FaxitronFinalDetector, folder_path: str, output_dir: Path, 
+                          verbose: bool = False, num_cores: int = 16) -> None:
+    """Process all images in a folder using parallel processing across multiple cores."""
+    print(f"\n{'='*80}")
+    print(f"STARTING PARALLEL FOLDER PROCESSING ({num_cores} cores)")
+    print(f"{'='*80}")
+    
+    folder_path = Path(folder_path)
+    
+    if not folder_path.exists():
+        print(f"❌ Error: Folder {folder_path} does not exist")
+        return
+    
+    print(f"📁 Processing folder: {folder_path}")
+    print(f"📁 Output directory: {output_dir}")
+    print(f"🚀 Using {num_cores} parallel cores")
+    
+    # Find all image files
+    print(f"\n🔍 Scanning for image files...")
+    image_extensions = {'.jpg', '.jpeg', '.png', '.tiff', '.tif', '.bmp'}
+    image_files = []
+    
+    for ext in image_extensions:
+        jpeg_files = list(folder_path.glob(f"*{ext}"))
+        jpeg_upper_files = list(folder_path.glob(f"*{ext.upper()}"))
+        image_files.extend(jpeg_files)
+        image_files.extend(jpeg_upper_files)
+        if verbose:
+            print(f"  Found {len(jpeg_files)} {ext} files")
+            print(f"  Found {len(jpeg_upper_files)} {ext.upper()} files")
+    
+    # Remove duplicates and sort
+    image_files = list(set(image_files))
+    image_files.sort()
+    
+    if not image_files:
+        print(f"❌ No image files found in {folder_path}")
+        return
+    
+    print(f"\n✅ Found {len(image_files)} total images to process")
+    if verbose:
+        print(f"📋 Image list:")
+        for i, img in enumerate(image_files[:10]):  # Show first 10
+            print(f"  {i+1:3d}. {img.name}")
+        if len(image_files) > 10:
+            print(f"  ... and {len(image_files) - 10} more images")
+    
+    # Create output directory
+    print(f"\n📂 Creating output directory: {output_dir}")
+    output_dir.mkdir(exist_ok=True)
+    
+    # Prepare arguments for parallel processing
+    print(f"\n🚀 Starting parallel image processing...")
+    print(f"{'='*80}")
+    
+    # Create argument tuples for each image
+    args_list = []
+    for i, image_file in enumerate(image_files, 1):
+        args_tuple = (detector, str(image_file), output_dir, i, len(image_files))
+        args_list.append(args_tuple)
+    
+    # Process images in parallel
+    start_time = time.time()
+    
+    # Use multiprocessing pool
+    with mp.Pool(processes=num_cores) as pool:
+        print(f"🔄 Starting {num_cores} worker processes...")
+        
+        # Process images in parallel with progress tracking
+        results = []
+        for i, result in enumerate(pool.imap_unordered(process_single_image_parallel, args_list), 1):
+            success, image_path, message = result
+            results.append((success, image_path, message))
+            
+            # Show progress
+            print(f"\n📊 Progress Update {i}/{len(image_files)}:")
+            print(f"  📸 Image: {Path(image_path).name}")
+            print(f"  ✅ Status: {'Success' if success else 'Failed'}")
+            print(f"  📝 Message: {message}")
+            print(f"  ⏱️  Progress: {i}/{len(image_files)} ({i/len(image_files)*100:.1f}%)")
+            
+            # Show time estimates
+            elapsed_time = time.time() - start_time
+            avg_time_per_image = elapsed_time / i
+            remaining_images = len(image_files) - i
+            estimated_remaining = remaining_images * avg_time_per_image
+            
+            print(f"  ⏱️  Elapsed: {elapsed_time:.1f}s, Avg per image: {avg_time_per_image:.1f}s")
+            print(f"  ⏱️  Estimated remaining time: {estimated_remaining:.1f}s ({estimated_remaining/60:.1f} minutes)")
+    
+    # Print final summary
+    total_time = time.time() - start_time
+    successful = sum(1 for success, _, _ in results if success)
+    failed = len(results) - successful
+    
+    print(f"\n{'='*80}")
+    print(f"🎉 PARALLEL PROCESSING COMPLETE")
+    print(f"{'='*80}")
+    print(f"📊 Results Summary:")
+    print(f"  ✅ Successfully processed: {successful}")
+    print(f"  ❌ Failed: {failed}")
+    print(f"  📁 Total images: {len(image_files)}")
+    print(f"  ⏱️  Total processing time: {total_time:.1f}s ({total_time/60:.1f} minutes)")
+    print(f"  📂 Results saved to: {output_dir}")
+    print(f"  🚀 Average speed: {len(image_files)/total_time:.2f} images/minute")
+    print(f"  🔄 Parallel cores used: {num_cores}")
+    print(f"  ⚡ Speedup factor: {len(image_files)/total_time / (len(image_files)/total_time * num_cores/16):.1f}x")
+    
+    if failed > 0:
+        print(f"\n⚠️  {failed} images failed to process. Failed images:")
+        for success, image_path, message in results:
+            if not success:
+                print(f"  ❌ {Path(image_path).name}: {message}")
+    
+    print(f"{'='*80}")
+
 def cli_main():
     """CLI entry point for the Faxitron Final Detector."""
     parser = argparse.ArgumentParser(
@@ -1181,8 +1641,14 @@ Examples:
   # Process a single image
   python faxitron_final_detector.py -i /path/to/image.jpg
   
-  # Process all images in a folder
+  # Process all images in a folder (sequential)
   python faxitron_final_detector.py -f /path/to/folder
+  
+  # Process all images in a folder (parallel, 16 cores)
+  python faxitron_final_detector.py -f /path/to/folder --parallel
+  
+  # Process all images in a folder (parallel, custom cores)
+  python faxitron_final_detector.py -f /path/to/folder --parallel --cores 8
   
   # Specify custom output directory
   python faxitron_final_detector.py -i /path/to/image.jpg -o /custom/output
@@ -1226,7 +1692,31 @@ Examples:
         help='Skip creating QC visualizations (faster processing)'
     )
     
+    parser.add_argument(
+        '--parallel',
+        action='store_true',
+        help='Use parallel processing for folder processing (default: 16 cores)'
+    )
+    
+    parser.add_argument(
+        '--cores',
+        type=int,
+        default=16,
+        help='Number of cores to use for parallel processing (default: 16)'
+    )
+    
     args = parser.parse_args()
+    
+    # Validate core count for parallel processing
+    if args.parallel:
+        available_cores = mp.cpu_count()
+        if args.cores > available_cores:
+            print(f"⚠️  Warning: Requested {args.cores} cores but only {available_cores} available")
+            print(f"   Using {available_cores} cores instead")
+            args.cores = available_cores
+        elif args.cores < 1:
+            print(f"⚠️  Warning: Invalid core count {args.cores}, using 1 core")
+            args.cores = 1
     
     # Initialize detector
     print("🚀 Initializing Faxitron Final Detector...")
@@ -1256,8 +1746,10 @@ Examples:
         
     elif args.folder:
         # Folder processing
-        print(f"📁 Processing folder: {args.folder}")
-        process_folder(detector, args.folder, output_dir, args.verbose)
+        if args.parallel:
+            process_folder_parallel(detector, args.folder, output_dir, args.verbose, args.cores)
+        else:
+            process_folder(detector, args.folder, output_dir, args.verbose)
     
     print(f"\n🎉 Processing complete!")
     return 0
