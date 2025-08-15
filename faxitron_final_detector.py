@@ -513,11 +513,37 @@ class FaxitronFinalDetector:
         # Filter out redundant main regions
         filtered_annotations = self.filter_redundant_regions(all_annotations)
         
-        # Find basic rectangles (main regions and large rectangles) FIRST
+        # Find basic rectangles - more permissive to include medium rectangles and other suitable shapes
         basic_rectangles = []
         for ann in filtered_annotations:
+            # Include main regions and large rectangles as before
             if ann['type'] in ['main_region', 'large_rectangle']:
                 basic_rectangles.append(ann)
+            # Also include medium rectangles that could contain text
+            elif ann['type'] == 'medium_rectangle':
+                # Check if medium rectangle has reasonable dimensions for text
+                w, h = ann['width'], ann['height']
+                area = ann['area']
+                aspect_ratio = ann['aspect_ratio']
+                
+                # Medium rectangles with good proportions for text (not too narrow, reasonable size)
+                if (w >= 50 and h >= 50 and  # Minimum size for text
+                    area >= 5000 and  # Minimum area for text content
+                    aspect_ratio >= 0.3 and aspect_ratio <= 3.0):  # Reasonable aspect ratio
+                    basic_rectangles.append(ann)
+                    print(f"  Including medium_rectangle {ann['id']} as basic rectangle (area: {area:.0f}, aspect: {aspect_ratio:.2f})")
+            # Consider small rectangles that might be text boxes
+            elif ann['type'] == 'small_rectangle':
+                w, h = ann['width'], ann['height']
+                area = ann['area']
+                aspect_ratio = ann['aspect_ratio']
+                
+                # Small rectangles that are square-ish and large enough for text
+                if (w >= 30 and h >= 30 and  # Minimum size
+                    area >= 1000 and  # Minimum area
+                    aspect_ratio >= 0.5 and aspect_ratio <= 2.0):  # More restrictive aspect ratio
+                    basic_rectangles.append(ann)
+                    print(f"  Including small_rectangle {ann['id']} as basic rectangle (area: {area:.0f}, aspect: {aspect_ratio:.2f})")
         
         # Remove duplicate regions with high overlap BEFORE text extraction
         print(f"Found {len(basic_rectangles)} basic rectangles, removing duplicates...")
@@ -588,7 +614,8 @@ class FaxitronFinalDetector:
             'processing_notes': {
                 'coordinate_system': 'center_based',
                 'color_detection': 'dynamic_non_greyscale',
-                'duplicate_removal': 'overlap_based'
+                'duplicate_removal': 'overlap_based',
+                'basic_rectangle_criteria': 'permissive_includes_medium_small_rectangles'
             }
         }
         
